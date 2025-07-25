@@ -1,0 +1,3 @@
+beyond_venv/
+beyond_venv/*
+.env
