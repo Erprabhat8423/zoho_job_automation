@@ -1,3 +1,10 @@
 beyond_venv/
 beyond_venv/*
 .env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+*.log
