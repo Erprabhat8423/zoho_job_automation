@@ -2,7 +2,7 @@ import os
 import sys
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import OperationalError
-from database.models import Base, Contact, Account, InternRole, get_database_url
+from database.models import Base, Contact, Account, InternRole, SyncTracker, get_database_url
 import logging
 
 # Configure logging
@@ -115,7 +115,7 @@ class DatabaseManager:
     
     def ensure_all_tables_exist(self):
         """Ensure all tables exist and are up to date"""
-        models = [Contact, Account, InternRole]
+        models = [Contact, Account, InternRole, SyncTracker]
         
         logger.info("Starting database schema check and update...")
         

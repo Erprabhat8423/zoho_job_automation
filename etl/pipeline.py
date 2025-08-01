@@ -1,13 +1,91 @@
 import json
-from database.models import Contact, Session
+from database.models import Contact, Session, SyncTracker
 from zoho.api_client import ZohoClient
 from sqlalchemy.exc import IntegrityError
-from datetime import datetime
+from datetime import datetime, timezone
 from database.migrations import run_migrations
 import logging
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+def get_sync_tracker(entity_type):
+    """Get sync tracker for a specific entity type"""
+    session = Session()
+    try:
+        tracker = session.query(SyncTracker).filter_by(entity_type=entity_type).first()
+        return tracker
+    finally:
+        session.close()
+
+def update_sync_tracker(entity_type, last_timestamp, records_count):
+    """Update sync tracker with latest sync information"""
+    session = Session()
+    try:
+        tracker = session.query(SyncTracker).filter_by(entity_type=entity_type).first()
+        if tracker:
+            tracker.last_sync_timestamp = last_timestamp
+            tracker.records_synced = records_count
+            tracker.updated_at = datetime.now()
+        else:
+            tracker = SyncTracker(
+                entity_type=entity_type,
+                last_sync_timestamp=last_timestamp,
+                records_synced=records_count
+            )
+            session.add(tracker)
+        
+        session.commit()
+        logger.info(f"Updated sync tracker for {entity_type}: timestamp={last_timestamp}, records={records_count}")
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error updating sync tracker for {entity_type}: {e}")
+        raise
+    finally:
+        session.close()
+
+def build_incremental_criteria(last_sync_timestamp):
+    """Build Zoho API criteria for incremental sync based on Modified_Time"""
+    if not last_sync_timestamp:
+        return None
+    
+    # Format timestamp for Zoho API (ISO format)
+    # Zoho expects format: YYYY-MM-DDTHH:mm:ss+HH:mm
+    if hasattr(last_sync_timestamp, 'tzinfo'):
+        if last_sync_timestamp.tzinfo is None:
+            last_sync_timestamp = last_sync_timestamp.replace(tzinfo=timezone.utc)
+    else:
+        logger.error(f"Expected datetime object but got {type(last_sync_timestamp)}: {last_sync_timestamp}")
+        return None
+    
+    formatted_time = last_sync_timestamp.strftime("%Y-%m-%dT%H:%M:%S%z")
+    # Add colon to timezone offset for Zoho API compatibility
+    if formatted_time.endswith('+0000'):
+        formatted_time = formatted_time[:-5] + '+00:00'
+    
+    criteria = f"(Modified_Time:greater_than:{formatted_time})"
+    logger.info(f"Built incremental criteria: {criteria}")
+    return criteria
+
+def get_latest_modified_time(records):
+    """Get the latest Modified_Time from a list of records"""
+    if not records:
+        return None
+    
+    latest_time = None
+    for record in records:
+        modified_time_str = record.get('Modified_Time')
+        if modified_time_str:
+            try:
+                # Parse Zoho timestamp
+                modified_time = datetime.fromisoformat(modified_time_str.replace('Z', '+00:00'))
+                if latest_time is None or modified_time > latest_time:
+                    latest_time = modified_time
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Could not parse Modified_Time '{modified_time_str}': {e}")
+                continue
+    
+    return latest_time
 
 def ensure_database_ready():
     """Ensure database tables exist and are up to date before running ETL"""
@@ -16,13 +94,29 @@ def ensure_database_ready():
         raise Exception("Database migration failed. Cannot proceed with ETL.")
     logger.info("Database schema check completed successfully")
 
-def sync_contacts():
+def sync_contacts(incremental=True):
     # Ensure database is ready before syncing
     ensure_database_ready()
     
     logger.info("Starting contact sync...")
     zoho = ZohoClient()
-    logger.info("Getting contact data from Zoho...")
+    
+    # Determine sync criteria
+    criteria = None
+    last_sync_info = ""
+    
+    if incremental:
+        tracker = get_sync_tracker('contacts')
+        if tracker and tracker.last_sync_timestamp:
+            criteria = build_incremental_criteria(tracker.last_sync_timestamp)
+            last_sync_info = f" (incremental from {tracker.last_sync_timestamp})"
+            logger.info(f"Performing incremental sync from: {tracker.last_sync_timestamp}")
+        else:
+            logger.info("No previous sync found, performing full sync")
+    else:
+        logger.info("Performing full sync (incremental=False)")
+    
+    logger.info(f"Getting contact data from Zoho{last_sync_info}...")
     contacts = zoho.get_paginated_data("Contacts", [
         "id", "First_Name", "Last_Name", "Email", "Phone", "Account_Name", "Title", "Department", "Modified_Time",
         "Age_on_Start_Date", "Timezone", "Contact_Last_Name", "$field_states", 
@@ -64,7 +158,7 @@ def sync_contacts():
         "Number_of_Days", "Agreement_finalised", "End_date_Auto_populated", "Industry_1_Areas", 
         "Last_Name", 
         "Total", "Visa_Owner", "Visa_Note_s", "House_rules"
-    ])
+    ], criteria=criteria, sort_by="Modified_Time", sort_order="asc")
     session = Session()
     
     logger.info(f"Processing {len(contacts)} contacts...")
@@ -290,7 +384,14 @@ def sync_contacts():
     
     try:
         session.commit()
-        logger.info("Contacts sync completed successfully")
+        
+        # Update sync tracker after successful commit
+        if contacts:
+            latest_modified_time = get_latest_modified_time(contacts)
+            if latest_modified_time:
+                update_sync_tracker('contacts', latest_modified_time, len(contacts))
+        
+        logger.info(f"Contacts sync completed successfully - processed {len(contacts)} records")
     except Exception as e:
         logger.error(f"Error during contact sync commit: {str(e)}")
         session.rollback()
@@ -298,12 +399,26 @@ def sync_contacts():
     finally:
         session.close()
 
-def sync_accounts():
+def sync_accounts(incremental=True):
     # Ensure database is ready before syncing
     ensure_database_ready()
     
     from database.models import Account
     zoho = ZohoClient()
+    
+    # Build criteria for incremental sync
+    criteria = None
+    if incremental:
+        tracker = get_sync_tracker('accounts')
+        if tracker:
+            criteria = build_incremental_criteria(tracker.last_sync_timestamp)
+            if criteria:
+                logger.info(f"Using incremental sync criteria for accounts: {criteria}")
+            else:
+                logger.info("No previous sync found for accounts, performing full sync")
+        else:
+            logger.info("No previous sync found for accounts, performing full sync")
+    
     accounts = zoho.get_paginated_data("Accounts", [
         "id", "Account_Name", "Industry", "Billing_Address", "Shipping_Address",
         "Owner", "Cleanup_Start_Date", "$field_states", "Management_Status",
@@ -317,13 +432,15 @@ def sync_accounts():
         "$is_duplicate", "Uni_State_if_in_US", "Follow_up_Date", "$review_process",
         "$layout_id", "$review", "Cleanup_Notes", "Gold_Rating",
         "Account_Notes", "Standard_working_hours", "Due_Diligence_Fields_to_Revise", "Uni_Country", "Cleanup_Phase", "Next_Reply_Date",
-        "Record_Status__s", "Type", "Layout",
+        "Record_Status__s", "Type", "Layout", "Modified_Time",
         "$in_merge", "Uni_Timezone", "Upon_to_Remote_interns", "Locked__s", "Company_Address", "Tag", "$approval_state",
         "$pathfinder", "Location", "Location_other", "Account_Status"
-    ])
+    ], criteria=criteria, sort_by="Modified_Time", sort_order="asc")
     session = Session()
-
-    for account in accounts:
+    
+    logger.info(f"Processing {len(accounts)} accounts...")
+    
+    for i, account in enumerate(accounts):
         existing = session.get(Account, account['id'])
         
         # Helper function to parse datetime
@@ -428,7 +545,8 @@ def sync_accounts():
 
             'location': account.get('Location'),
             'location_other': account.get('Location_other'),
-            'account_status': account.get('Account_Status')
+            'account_status': account.get('Account_Status'),
+            'modified_time': parse_datetime(account.get('Modified_Time'))
         }
         
         if existing:
@@ -441,30 +559,55 @@ def sync_accounts():
     
     try:
         session.commit()
+        
+        # Update sync tracker for accounts
+        if incremental and accounts:
+            latest_modified_time = get_latest_modified_time(accounts)
+            if latest_modified_time:
+                update_sync_tracker('accounts', latest_modified_time, len(accounts))
+                logger.info(f"Updated sync tracker for accounts: {len(accounts)} records, latest timestamp: {latest_modified_time}")
+        
+        logger.info(f"Successfully processed {len(accounts)} accounts")
     except IntegrityError:
         session.rollback()
         raise
     finally:
         session.close()
 
-def sync_intern_roles():
+def sync_intern_roles(incremental=True):
     # Ensure database is ready before syncing
     ensure_database_ready()
     
     from database.models import InternRole
     zoho = ZohoClient()
+    
+    # Build criteria for incremental sync
+    criteria = None
+    if incremental:
+        tracker = get_sync_tracker('intern_roles')
+        if tracker:
+            criteria = build_incremental_criteria(tracker.last_sync_timestamp)
+            if criteria:
+                logger.info(f"Using incremental sync criteria for intern roles: {criteria}")
+            else:
+                logger.info("No previous sync found for intern roles, performing full sync")
+        else:
+            logger.info("No previous sync found for intern roles, performing full sync")
+    
     intern_roles = zoho.get_paginated_data("Intern_Roles", [
         "id", "Name", "Role_Title", "Role_Description_Requirements", "Role_Status", 
         "Role_Function", "Role_Department_Size", "Role_Attachments_JD", 
-        "Role_Tags", "Start_Date", "End_Date", "Created_Time",
+        "Role_Tags", "Start_Date", "End_Date", "Created_Time", "Modified_Time",
         "Intern_Company", "Company_Work_Policy", "Location", 
         "Open_to_Remote", "Due_Diligence_Status_2",
         "Account_Outreach_Status", "Record_Status__s", "Approval_State", "Management_Status", 
         "Placement_Fields_to_Revise", "Placement_Revision_Notes", "Gold_Rating", "Locked__s"
-    ])
+    ], criteria=criteria, sort_by="Modified_Time", sort_order="asc")
     session = Session()
+    
+    logger.info(f"Processing {len(intern_roles)} intern roles...")
 
-    for role in intern_roles:
+    for i, role in enumerate(intern_roles):
         existing = session.get(InternRole, role['id'])
         
         # Helper function to parse datetime
@@ -533,6 +676,15 @@ def sync_intern_roles():
     
     try:
         session.commit()
+        
+        # Update sync tracker for intern roles
+        if incremental and intern_roles:
+            latest_modified_time = get_latest_modified_time(intern_roles)
+            if latest_modified_time:
+                update_sync_tracker('intern_roles', latest_modified_time, len(intern_roles))
+                logger.info(f"Updated sync tracker for intern roles: {len(intern_roles)} records, latest timestamp: {latest_modified_time}")
+        
+        logger.info(f"Successfully processed {len(intern_roles)} intern roles")
     except IntegrityError:
         session.rollback()
         raise

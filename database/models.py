@@ -2,12 +2,27 @@ from sqlalchemy import Column, String, Integer, DateTime, create_engine, Text, B
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 import os
+from datetime import datetime
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
 
 Base = declarative_base()
+
+# Sync tracking table
+class SyncTracker(Base):
+    __tablename__ = "sync_tracker"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    entity_type = Column(String(50), nullable=False, unique=True)  # 'contacts', 'accounts', 'intern_roles'
+    last_sync_timestamp = Column(DateTime, nullable=True)  # Last Modified_Time processed
+    records_synced = Column(Integer, default=0)  # Count of records processed in last sync
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    
+    def __repr__(self):
+        return f"<SyncTracker(entity_type='{self.entity_type}', last_sync_timestamp='{self.last_sync_timestamp}')>"
 
 class Contact(Base):
     __tablename__ = "contacts"
@@ -279,6 +294,46 @@ def get_database_url():
     db = os.getenv('MYSQL_DB', 'beyond_academy')
     
     return f"mysql+mysqlconnector://{user}:{password}@{host}:{port}/{db}"
+
+class Document(Base):
+    __tablename__ = "documents"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    contact_id = Column(String(255), nullable=False)  # Zoho contact ID
+    document_id = Column(String(255), nullable=False)  # Zoho attachment/document ID
+    document_name = Column(String(255), nullable=False)  # Original filename
+    document_type = Column(String(50), nullable=False)  # 'CV', 'Resume', 'Portfolio', etc.
+    file_path = Column(String(500), nullable=False)  # Local file path where downloaded
+    file_size = Column(Integer)  # File size in bytes
+    download_date = Column(DateTime, default=datetime.now)  # When downloaded
+    zoho_created_time = Column(DateTime)  # When created in Zoho
+    zoho_modified_time = Column(DateTime)  # When last modified in Zoho
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    
+    def __repr__(self):
+        return f"<Document(contact_id='{self.contact_id}', document_name='{self.document_name}', file_path='{self.file_path}')>"
+
+
+class Skill(Base):
+    __tablename__ = "skills"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    contact_id = Column(String(255), nullable=False)  # Zoho contact ID
+    document_id = Column(Integer, nullable=False)  # Reference to document table
+    skill_name = Column(String(255), nullable=False)  # Name of the skill
+    skill_category = Column(String(100))  # Technical, Programming, Language, Soft Skill, etc.
+    proficiency_level = Column(String(50))  # Beginner, Intermediate, Advanced, Expert
+    years_experience = Column(String(50))  # Years of experience with the skill
+    confidence_score = Column(Float)  # Confidence in extraction (0.0-1.0)
+    extraction_method = Column(String(50), nullable=False)  # OpenAI GPT-3.5-turbo, Manual, etc.
+    source_context = Column(Text)  # Context where skill was found
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    
+    def __repr__(self):
+        return f"<Skill(contact_id='{self.contact_id}', skill_name='{self.skill_name}', skill_category='{self.skill_category}')>"
+
 
 DB_URL = get_database_url()
 engine = create_engine(DB_URL)
